@@ -59,8 +59,6 @@ library(tidyr)
 library(ggplot2)
 library(stringr)
 
-# Growth curves
-library(FLCore)
 ```
 ## 📦 Methods
 We use the ELEFAN implementation from **TropFishR** to estimate:
