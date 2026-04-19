@@ -1,0 +1,578 @@
+---
+title: "VBGF ELEFAN "
+author: "Amina TIFOURA"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  pdf_document:
+    number_sections: true
+subtitle: "Length-based growth parameters estimation for HKE - FISHBOOT"
+urlcolor: blue
+header-includes: \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = TRUE,
+  fig.width = 10,
+  fig.height = 7,
+  dpi = 150
+)
+```
+
+**Purpose**: Clean, modular workflow for estimating VBGF parameters from LFQ data using ELEFAN. This version removes repeated code blocks by wrapping the workflow into reusable functions and running them across multiple datasets (GSA-specific or combined).
+
+## 1. Packages
+
+```{r packages}
+# Core
+library(TropFishR)
+library(fishboot)
+library(here)
+
+# Data and plots
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+
+# Growth curves
+library(FLCore)
+```
+
+## 2. Configuration (edit here)
+
+```{r config}
+# Paths
+input_dir  <- here("2.1 _ Growth/2.1.1_merged_data/1.15.LFDs_catch_for_growth/by_sex/17-24")
+output_dir <- here("2.1.1_Outputs_VGB/females_nonboot_17-24")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+species <- "HKE"
+sex     <- "F"
+
+# Input datasets (read once)
+gsa_files <- tibble::tribble(
+  ~id,        ~file,                   ~gsa,
+  "GSA6",     "LFD_female_GSA06_wide.csv",  "6" 
+)
+
+input_data <- setNames(
+  lapply(gsa_files$file, function(f) {
+    read.delim(file.path(input_dir, f), sep = ";", check.names = FALSE)
+  }),
+  gsa_files$file
+)
+
+# Period 
+# periods <- c("2021-2024")#, "2017-2019")#, "2007-2010")
+periods <- c("2017-2024")
+
+# Period date ranges
+period_ranges <- tibble::tribble(
+  ~period,      ~P1,                 ~P2,
+  "2017-2024",  as.Date("2017-01-15"), as.Date("2024-10-15") #,
+  # "2021-2024",  as.Date("2021-01-15"), as.Date("2024-10-15"),
+  #"2017-2019",  as.Date("2017-01-15"), as.Date("2019-10-15") #,
+  #"2007-2010",  as.Date("2007-01-15"), as.Date("2010-10-15")
+)
+
+# Label for outputs
+time_label <- if (length(periods) == 1) periods else paste(periods, collapse = "_")
+
+saveRDS(input_data, file = file.path(output_dir, "input_GSA_scenarios.rds"))
+
+```
+
+# from LFQ data by restructuring it and fitting growth curves to the restructured data (Pauly 1980). It is recommended to start by visualising the raw and restructured LFQ data, which aids in determining an appropriate bin size and the moving average of the restructuring procedure. The function lfqModify allows changing the bin size by setting the argument bin_size to a numeric value. The function lfqRestructure is used for the restructuring process, where the argument MA allows the control of the number of bins used for the moving average and the argument addl.sqrt allows for an additional square root transformation in the restructuring process, which reduces the weighting of large individuals.
+
+```{r config}
+# 3rd try
+# LFQ processing and ELEFAN settings
+bin_size <- 2
+ma       <- 7 # moving average by default is 5,  the youngest length in the cohort 0 is 9, so 7 should be the ideal 
+age_grid <- seq(0, 7, by = 0.1)
+
+# other settings
+k_range       <- c(0.10, 0.25)
+linf_mult     <- c(0.80, 1.00)  # Linf bounds relative to Linf guess
+seasonalised  <- FALSE
+addl_sqrt     <- FALSE 
+pcrossover    <-  0.95
+popSize       <- 50
+maxiter       <- 100
+parallel      <- TRUE
+# t_anchor_range <- c(0.25,0.5)
+t_anchor_range <- c(0,1)
+
+# Optional diagnostic plot
+run_diagnostic <- TRUE
+
+```
+
+## 3. Datasets to run
+
+```{r datasets}
+# Combine GSAs with periods
+datasets <- tidyr::crossing(gsa_files, period_ranges) %>%
+  mutate(id = paste(id, period, sep = "_"))
+```
+## 4. Functions
+
+```{r functions}
+
+plot_res <- 150
+open_png <- function(filename, width = 10.5, height = 7.5, res = plot_res) {
+  if (capabilities("cairo")) {
+    png(filename, width = width, height = height, units = "in",
+        res = res, type = "cairo", bg = "white")
+  } else {
+    png(filename, width = width, height = height, units = "in",
+        res = res, bg = "white")
+  }
+}
+
+apply_plot_style <- function() {
+  old <- par(no.readonly = TRUE)
+  par(
+    mar = c(4.2, 4.6, 2.4, 1.4),
+    mgp = c(2.2, 0.7, 0),
+    tcl = -0.3,
+    las = 1,
+    cex.axis = 1.0,
+    cex.lab = 1.1,
+    cex.main = 1.2
+  )
+  old
+}
+
+save_base_plot <- function(filename, width = 10.5, height = 7.5, res = plot_res, expr) {
+  open_png(filename, width = width, height = height, res = res)
+  opar <- apply_plot_style()
+  on.exit({
+    par(opar)
+    dev.off()
+  }, add = TRUE)
+  eval(substitute(expr), envir = parent.frame())
+}
+
+build_lfq <- function(df, date_col = NULL, date_start_col = 2) {
+  # date_col: if your data has a column with dates, give its name or index
+  # date_start_col: if dates are in column names, the first column index that is NOT a date (default 1 = midLengths, so dates start at 2)
+  if (!requireNamespace("lubridate", quietly = TRUE)) {
+    stop("Please install the 'lubridate' package: install.packages('lubridate')")
+  }
+  # copy to avoid side effects
+  d <- df
+  
+  # Clean column names
+  nm <- names(d)
+  nm_clean <- trimws(nm)
+  nm_clean <- gsub("^X", "", nm_clean)        # remove leading X
+  nm_clean <- gsub("\\.", "/", nm_clean)      # dots -> slashes
+  nm_clean <- gsub("-", "/", nm_clean)        # hyphens -> slashes
+  names(d) <- nm_clean
+  
+  # If the user specified a date column, parse that
+  if (!is.null(date_col)) {
+    colname <- if (is.numeric(date_col)) names(d)[date_col] else as.character(date_col)
+    raw_dates <- as.character(d[[colname]])
+    parsed <- lubridate::dmy(raw_dates)
+    if (all(is.na(parsed))) parsed <- lubridate::ymd(raw_dates)
+    if (all(is.na(parsed))) parsed <- lubridate::mdy(raw_dates)
+    if (all(is.na(parsed))) parsed <- as.Date(raw_dates, tryFormats = c("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"))
+    dates <- parsed
+    # remove date column from catch if necessary
+    catch_cols <- setdiff(seq_along(d), which(names(d) == colname))
+    midLengths <- d[[1]]
+    catch <- as.matrix(d[, catch_cols, drop = FALSE])
+  } else {
+    # Dates are in column names: detect date-like names
+    # Heuristic: names that match dd/mm/yyyy or d/m/yyyy or yyyy/mm/dd
+    is_date_like <- grepl("^\\s*\\d{1,4}[/\\.\\-]\\d{1,2}[/\\.\\-]\\d{2,4}\\s*$", names(d))
+    # If none detected, assume dates start at date_start_col
+    if (!any(is_date_like)) {
+      date_names <- names(d)[date_start_col:ncol(d)]
+    } else {
+      date_names <- names(d)[is_date_like]
+    }
+    # parse date names
+    date_names_char <- as.character(date_names)
+    parsed <- lubridate::dmy(date_names_char)
+    if (all(is.na(parsed))) parsed <- lubridate::ymd(date_names_char)
+    if (all(is.na(parsed))) parsed <- lubridate::mdy(date_names_char)
+    # final fallback
+    if (all(is.na(parsed))) parsed <- as.Date(date_names_char, tryFormats = c("%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"))
+    # warn if some failed
+    if (any(is.na(parsed))) {
+      warning("Some column-name dates failed to parse: ",
+              paste(date_names_char[is.na(parsed)], collapse = ", "))
+    }
+    dates <- parsed
+    # build midLengths and catch matrix
+    midLengths <- d[[1]]
+    # determine which columns correspond to the date_names (use positions)
+    date_positions <- which(names(d) %in% date_names_char)
+    catch <- as.matrix(d[, date_positions, drop = FALSE])
+    # ensure column names of catch are the parsed dates (character)
+    colnames(catch) <- as.character(dates)
+  }
+  
+  # Final checks
+  if (length(dates) != ncol(catch)) {
+    warning("Number of parsed dates (", length(dates), ") does not match number of catch columns (", ncol(catch), ").")
+  }
+  
+  lfqnew <- list(
+    dates = as.Date(dates),
+    midLengths = midLengths,
+    catch = catch
+  )
+  class(lfqnew) <- "lfq"
+  lfqnew
+}
+
+subset_lfq_dates <- function(lfq, start_date, end_date) {
+  idx <- lfq$dates >= start_date & lfq$dates <= end_date
+  lfq$dates <- lfq$dates[idx]
+  lfq$catch <- lfq$catch[, idx, drop = FALSE]
+  lfq
+}
+
+compute_bounds <- function(lfq_bin, linf_mult, k_range) {
+  linf_guess <- max(lfq_bin$midLengths) / 0.95   # set Lmax/0.95 as prior of Linf
+  low_par <- list(
+    Linf = linf_mult[1] * linf_guess,
+    K = k_range[1],
+    t_anchor = t_anchor_range[1], # time point anchoring growth curves in year-length coordinate system, corresponds to peak spawning month (range: 0 to 1, default: 0.25)
+    C = 0, # amplitude of growth oscillation (range: 0 to 1, default: 0)
+    ts = 0  # (ts = WP - 0.5) (range: 0 to 1, default: 0)
+  )
+  up_par <- list(
+    Linf = linf_mult[2] * linf_guess,
+    K = k_range[2],
+    t_anchor = t_anchor_range[2],
+    C = 0,
+    ts = 0
+  )
+  list(linf_guess = linf_guess, low_par = low_par, up_par = up_par)
+}
+
+summarise_boot <- function(res_GA) {
+  pars_median <- as.list(apply(res_GA$bootRaw[, c("Linf", "K", "t_anchor")], 2, median))
+  pars <- data.frame(method = "median", as.list(pars_median))
+  pars$t0 <- -(1 - pars$t_anchor)
+  pars
+}
+
+make_vbgf_curve <- function(pars_row, age = age_grid) {
+  FLCore::vonbert(pars_row$Linf, pars_row$K, pars_row$t0, age)
+}
+
+plot_raw_restructured <- function(lfq_res, out_file) {
+  save_base_plot(out_file, height = 8.5, expr = {
+    par(mfrow = c(2, 1), mar = c(2.2, 5.0, 2.0, 1.5), oma = c(2, 0, 0, 0))
+    plot(lfq_res, Fname = "catch", date.axis = "modern")
+    plot(lfq_res, Fname = "rcounts", date.axis = "modern")
+  })
+}
+
+plot_fits <- function(lfq_bin, lfq_res, res_GA, out_fit, out_resid) {
+  save_base_plot(out_resid, expr = {
+    plot(lfq_res, Fname = "rcounts", date.axis = "modern")
+  })
+
+  save_base_plot(out_fit, expr = {
+    plot(lfq_res, Fname = "catch", date.axis = "modern")
+    lfqFitCurves(lfq_bin, par = res_GA$par, draw = TRUE, col = "green4", lty = 1, lwd = 0.8)
+  })
+}
+
+plot_final_curve <- function(res_GA, out_file, age = age_grid) {
+  Linf <- res_GA$par$Linf
+  K    <- res_GA$par$K
+  t0   <- -(1 - res_GA$par$t_anchor)
+
+  eq <- paste0("Linf=", round(Linf), "; k=", round(K, 2), "; t0=", round(t0, 2))
+
+  save_base_plot(out_file, width = 8.5, height = 6.5, expr = {
+    plot(
+      age, Linf * (1 - (exp(-K * (age - t0)))),
+      main = eq, type = "o", pch = 19, lwd = 2,
+      col = "green4", ylab = "Length (cm)", xlab = "Age (years)"
+    )
+    grid(col = "gray45", lty = 0.5)
+  })
+}
+
+```
+
+#5.1 ELEFAN METHODS (NO BOOTSTRAP)
+
+```{r}
+run_elefan_workflow <- function(file, gsa, period, P1, P2, species, sex) {
+  
+  df <- input_data[[file]]
+  if (is.null(df)) {
+    stop("Input file not found in input_data: ", file)
+  }
+
+  lfq_raw <- build_lfq(df)
+
+  # Subset period
+  lfq_win <- subset_lfq_dates(lfq_raw, P1, P2)
+
+  # Modify bin & restructure
+  lfq_bin <- lfqModify(lfq_win, bin_size = bin_size)
+  lfq_res <- lfqRestructure(lfq_bin)
+
+  name <- paste0(species, "_", sex, "_GSA", gsa, "_", period)
+
+  # Save raw vs restructured
+  plot_raw_restructured(
+    lfq_res,
+    file.path(output_dir, paste0(name, "_raw_data.png"))
+  )
+
+  # Parameter bounds
+  bounds <- compute_bounds(lfq_bin, linf_mult, k_range)
+
+  # -----------------------------
+  # ELEFAN METHODS (NO BOOTSTRAP)
+  # -----------------------------
+  # GA (main method)
+  res_GA <- ELEFAN_GA(
+    lfq_bin,
+    MA = ma,
+    seasonalised = seasonalised,
+    addl.sqrt = addl_sqrt,
+    low_par = bounds$low_par,
+    up_par  = bounds$up_par,
+    pcrossover = pcrossover,
+    popSize = popSize,
+    maxiter = maxiter,
+    parallel = parallel
+  )
+
+  # Simulated Annealing
+  res_SA <- ELEFAN_SA(
+    lfq_bin,
+    MA = ma,
+    seasonalised = seasonalised,
+    addl.sqrt = addl_sqrt,
+    low_par = bounds$low_par,
+    up_par  = bounds$up_par
+  )
+
+  # Classic ELEFAN
+  res_classic <- ELEFAN(
+    lfq_bin,
+    MA = ma,
+    cross.max = TRUE,
+    contour = TRUE,
+    K_range = exp(seq(log(0.1), log(10), length.out = 100))) #seq(k_range[1], k_range[2], length.out = 20)
+ 
+  # -----------------------------
+  # PLOTS
+  # -----------------------------
+  # GA fit (main result)
+  plot_fits(
+    lfq_bin, lfq_res, res_GA,
+    out_fit = file.path(output_dir, paste0(name, "_fit_GA.png")),
+    out_resid = file.path(output_dir, paste0(name, "_residuals_GA.png"))
+  )
+
+  # Comparison plot
+  save_base_plot(file.path(output_dir, paste0(name, "_compare_methods.png")), expr = {
+    plot(lfq_res, Fname = "catch", date.axis = "modern")
+
+    lfqFitCurves(lfq_bin, par = res_GA$par,
+                 draw = TRUE, col = "blue", lwd = 1)
+
+    lfqFitCurves(lfq_bin, par = res_SA$par,
+                 draw = TRUE, col = "red", lty = 2)
+
+    lfqFitCurves(lfq_bin, par = res_classic$par,
+                 draw = TRUE, col = "black", lty = 3)
+
+    legend("bottomright",
+           legend = c("GA", "SA", "Classic"),
+           col = c("blue", "red", "black"),
+           lty = c(1,2,3),
+           bty = "n")
+  })
+
+  # Final VBGF curve (GA only)
+  plot_final_curve(
+    res_GA,
+    file.path(output_dir, paste0(name, "_VBGF.png"))
+  )
+
+  # -----------------------------
+  # SAVE RESTRUCTURED DATA
+  # -----------------------------
+
+  lfq_res_df <- data.frame(midLength = lfq_res$midLengths, lfq_res$rcounts)
+  colnames(lfq_res_df)[-1] <- format(lfq_res$dates, "%Y-%m-%d")
+
+  write.csv(
+    lfq_res_df,
+    file.path(output_dir, paste0(name, "_lfq_res.csv")),
+    row.names = FALSE
+  )
+  # -----------------------------
+  # RETURN RESULTS
+  # -----------------------------
+  list(
+    name = name,
+    gsa = gsa,
+    period = period,
+    res_GA = res_GA,
+    res_SA = res_SA,
+    res_classic = res_classic,
+    lfq_bin = lfq_bin,
+    lfq_res = lfq_res
+  )
+}
+
+datasets <- tidyr::crossing(gsa_files, period_ranges)
+
+pb <- txtProgressBar(min = 0, max = nrow(datasets), style = 3)
+results <- vector("list", nrow(datasets))
+
+for (i in seq_len(nrow(datasets))) {
+  results[[i]] <- run_elefan_workflow(
+    file = datasets$file[i],
+    gsa = datasets$gsa[i],
+    period = datasets$period[i],
+    P1 = datasets$P1[i],
+    P2 = datasets$P2[i],
+    species = species,
+    sex = sex
+  )
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+names(results) <- datasets$id
+
+saveRDS(results, file.path(output_dir, paste0("results_", time_label, ".rds")))
+
+param_table <- do.call(rbind, lapply(results, function(x) {
+  data.frame(
+    id = x$name,
+    period = x$period,
+    area = paste0("GSA", x$gsa),
+
+    Linf_GA = x$res_GA$par$Linf,
+    K_GA    = x$res_GA$par$K,
+    t_anchor_GA = x$res_GA$par$t_anchor,
+    Rn_GA = x$res_GA$Rn,
+
+    Linf_SA = x$res_SA$par$Linf,
+    K_SA    = x$res_SA$par$K,
+    t_anchor_SA = x$res_SA$par$t_anchor,
+    Rn_SA = x$res_SA$Rn,
+
+    Linf_classic = x$res_classic$par$Linf,
+    K_classic    = x$res_classic$par$K,
+    t_anchor_classic = x$res_classic$par$t_anchor,
+    Rn_classic = x$res_classic$Rn
+  )
+}))
+
+write.csv(
+  param_table,
+  file.path(output_dir, paste0("elefan_parameters_", time_label, ".csv")),
+  row.names = FALSE
+)
+
+# Select best method per row (highest Rn)
+best_method <- apply(
+  param_table[, c("Rn_GA", "Rn_SA", "Rn_classic")],
+  1,
+  function(x) {
+    methods <- c("GA", "SA", "classic")
+    methods[which.max(x)]
+  }
+)
+
+param_table$best_method <- best_method
+best_table <- do.call(rbind, lapply(seq_len(nrow(param_table)), function(i) {
+
+  row <- param_table[i, ]
+
+  if (row$best_method == "GA") {
+    data.frame(
+      id = row$id,
+      period = row$period,
+      area = row$area,
+      method = "GA",
+      Linf = row$Linf_GA,
+      K    = row$K_GA,
+      t_anchor = row$t_anchor_GA,
+      Rn   = row$Rn_GA
+    )
+    
+  } else if (row$best_method == "SA") {
+    data.frame(
+      id = row$id,
+      period = row$period,
+      area = row$area,
+      method = "SA",
+      Linf = row$Linf_SA,
+      K    = row$K_SA,
+      t_anchor = row$t_anchor_SA,
+      Rn   = row$Rn_SA
+    )
+    
+  } else {
+    data.frame(
+      id = row$id,
+      period = row$period,
+      area = row$area,
+      method = "classic",
+      Linf = row$Linf_classic,
+      K    = row$K_classic,
+      t_anchor = row$t_anchor_classic,
+      Rn   = row$Rn_classic
+    )
+  }
+}))
+
+# Full table (all methods)
+write.csv(
+  param_table,
+  file.path(output_dir, paste0("elefan_all_methods_", time_label, ".csv")),
+  row.names = FALSE
+)
+
+# Best-only table
+write.csv(
+  best_table,
+  file.path(output_dir, paste0("elefan_best_method_", time_label, ".csv")),
+  row.names = FALSE
+)
+
+best_method <- apply(
+  param_table[, c("Rn_GA", "Rn_SA", "Rn_classic")],
+  1,
+  function(x) {
+    methods <- c("GA", "SA", "classic")
+    
+    # If very close (within 1%), prefer GA
+    if (max(x) - x[1] < 0.01) {
+      return("GA")
+    } else {
+      return(methods[which.max(x)])
+    }
+  }
+)
+
+```
